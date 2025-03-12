@@ -17,10 +17,11 @@ admin.initializeApp({
 // 3) Accéder à Firestore
 const db = admin.firestore();
 
-// 4) Configuration MQTT (HiveMQ, etc.)
-const brokerUrl = "mqtts://ded8d24a57f247ba9836a456fc42d9d3.s1.eu.hivemq.cloud"; // Ton broker
-const mqttUser = "azerty";   // Identifiant
-const mqttPass = "Trailapp18"; // Mot de passe
+// 4) Configuration MQTT (optionnel, si tu veux toujours publier des alertes)
+const brokerUrl = "mqtts://ded8d24a57f247ba9836a456fc42d9d3.s1.eu.hivemq.cloud";
+const mqttUser = "azerty";
+const mqttPass = "Trailapp18";
+
 // Connecter le client MQTT
 const client = mqtt.connect(brokerUrl, {
   username: mqttUser,
@@ -35,25 +36,102 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Route de test GET (optionnel)
+// (Optionnel) Route de test GET
 app.get("/", (req, res) => {
   res.send("Hello from Render!");
 });
 
 /**********************************************
- * 6) Endpoint /updateParticipant
- *    Reçoit { bibNumber, courseId, deviceId, name, status }
- *    => Collection participants/{bibNumber}
+ * A) Endpoint /createUserAndParticipant
+ *    Permet de créer/mettre à jour l'utilisateur (users)
+ *    ET le participant (participants) en une requête
+ *    Reçoit:
+ *    {
+ *      email, firstname, lastname, role,
+ *      bibNumber, courseId, deviceId, status
+ *    }
+ **********************************************/
+app.post("/createUserAndParticipant", async (req, res) => {
+  try {
+    const {
+      email,
+      firstname,
+      lastname,
+      role,
+      bibNumber,
+      courseId,
+      deviceId,
+      status
+    } = req.body;
+
+    if (!email || !bibNumber || !courseId || !deviceId || !status) {
+      return res.status(400).send("Missing fields: email, bibNumber, courseId, deviceId, status");
+    }
+
+    // 1) Chercher l'utilisateur par email
+    const usersRef = db.collection("users");
+    const querySnap = await usersRef.where("email", "==", email).get();
+    let userDocId;
+
+    if (!querySnap.empty) {
+      // L'utilisateur existe déjà
+      userDocId = querySnap.docs[0].id;
+      console.log("User found with id:", userDocId);
+    } else {
+      // 2) Créer le doc user
+      const newUserRef = await usersRef.add({
+        email,
+        firstname: firstname || "",
+        lastname: lastname || "",
+        role: role || "coureur",
+        createdAt: new Date().toISOString()
+      });
+      userDocId = newUserRef.id;
+      console.log("New user created with id:", userDocId);
+    }
+
+    // 3) Créer/Mettre à jour le doc participant participants/{bibNumber}
+    await db.collection("participants").doc(String(bibNumber)).set({
+      userId: userDocId,
+      bibNumber,
+      courseId,
+      deviceId,
+      status,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+
+    // Si status == "abandon", on publie un message MQTT
+    if (status === "abandon") {
+      client.publish("trail/alerts", JSON.stringify({
+        userId: userDocId,
+        bibNumber,
+        courseId,
+        deviceId,
+        status,
+        timestamp: Date.now()
+      }));
+    }
+
+    res.send("User and participant created/updated successfully");
+  } catch (err) {
+    console.error("Erreur /createUserAndParticipant:", err);
+    res.status(500).send("Erreur serveur");
+  }
+});
+
+/**********************************************
+ * B) Endpoint /updateParticipant
+ *    Reçoit { userId, bibNumber, courseId, deviceId, name, status }
  **********************************************/
 app.post("/updateParticipant", async (req, res) => {
   try {
-    const { bibNumber, courseId, deviceId, name, status } = req.body;
-    if (!bibNumber || !courseId || !deviceId || !name || !status) {
-      return res.status(400).send("Missing fields: bibNumber, courseId, deviceId, name, status");
+    const { userId, bibNumber, courseId, deviceId, name, status } = req.body;
+    if (!userId || !bibNumber || !courseId || !deviceId || !name || !status) {
+      return res.status(400).send("Missing fields: userId, bibNumber, courseId, deviceId, name, status");
     }
 
-    // participants/{bibNumber}
     await db.collection("participants").doc(String(bibNumber)).set({
+      userId,
       bibNumber,
       courseId,
       deviceId,
@@ -62,9 +140,9 @@ app.post("/updateParticipant", async (req, res) => {
       updatedAt: new Date().toISOString(),
     }, { merge: true });
 
-    // Exemple : si status == "abandon", on publie un message MQTT
     if (status === "abandon") {
       client.publish("trail/alerts", JSON.stringify({
+        userId,
         bibNumber,
         courseId,
         deviceId,
@@ -83,9 +161,8 @@ app.post("/updateParticipant", async (req, res) => {
 });
 
 /**********************************************
- * 7) Endpoint /addPosition
+ * C) Endpoint /addPosition
  *    Reçoit { bibNumber, latitude, longitude, timestamp }
- *    => Sous-collection participants/{bibNumber}/positions
  **********************************************/
 app.post("/addPosition", async (req, res) => {
   try {
@@ -94,14 +171,13 @@ app.post("/addPosition", async (req, res) => {
       return res.status(400).send("Missing fields: bibNumber, latitude, longitude");
     }
 
-    // participants/{bibNumber}/positions/(autoId)
-    const docRef = db.collection("participants").doc(String(bibNumber))
-                     .collection("positions");
-    await docRef.add({
-      latitude,
-      longitude,
-      timestamp: timestamp || new Date().toISOString(),
-    });
+    await db.collection("participants").doc(String(bibNumber))
+      .collection("positions")
+      .add({
+        latitude,
+        longitude,
+        timestamp: timestamp || new Date().toISOString()
+      });
 
     res.send("Position ajoutée dans la sous-collection positions.");
   } catch (err) {
@@ -111,9 +187,8 @@ app.post("/addPosition", async (req, res) => {
 });
 
 /**********************************************
- * 8) Endpoint /addCheckpoint
+ * D) Endpoint /addCheckpoint
  *    Reçoit { bibNumber, validated, timestamp }
- *    => Sous-collection participants/{bibNumber}/checkpoints
  **********************************************/
 app.post("/addCheckpoint", async (req, res) => {
   try {
@@ -122,17 +197,50 @@ app.post("/addCheckpoint", async (req, res) => {
       return res.status(400).send("Missing field: bibNumber");
     }
 
-    // participants/{bibNumber}/checkpoints/(autoId)
-    const docRef = db.collection("participants").doc(String(bibNumber))
-                     .collection("checkpoints");
-    await docRef.add({
-      validated: validated ?? true, // si non défini, on met true par défaut
-      timestamp: timestamp || new Date().toISOString(),
-    });
+    await db.collection("participants").doc(String(bibNumber))
+      .collection("checkpoints")
+      .add({
+        validated: validated ?? true,
+        timestamp: timestamp || new Date().toISOString()
+      });
 
     res.send("Checkpoint ajouté dans la sous-collection checkpoints.");
   } catch (err) {
     console.error("Erreur dans /addCheckpoint:", err);
+    res.status(500).send("Erreur serveur");
+  }
+});
+
+/**********************************************
+ * E) Endpoint /listUsers
+ *    Récupère tous les docs users,
+ *    pour chacun, on récupère participants
+ **********************************************/
+app.get("/listUsers", async (req, res) => {
+  try {
+    const usersSnap = await db.collection("users").get();
+    const usersArray = [];
+
+    for (const userDoc of usersSnap.docs) {
+      const userData = userDoc.data();
+      const userId = userDoc.id;
+
+      // Récupérer les participants liés à userId
+      const partsSnap = await db.collection("participants")
+        .where("userId", "==", userId)
+        .get();
+      const partList = partsSnap.docs.map(d => d.data());
+
+      usersArray.push({
+        userId,
+        ...userData,
+        participants: partList
+      });
+    }
+
+    res.json(usersArray);
+  } catch (err) {
+    console.error("Erreur /listUsers:", err);
     res.status(500).send("Erreur serveur");
   }
 });
